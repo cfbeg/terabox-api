@@ -3,7 +3,19 @@ import crypto from 'node:crypto';
 import readline from 'node:readline';
 
 import crc32 from 'crc-32';
-import { filesize } from 'filesize';
+
+function formatBytes(bytes, standard = 'iec', round = 3) {
+    const base = standard === 'iec' ? 1024 : 1000;
+    const units = standard === 'iec'
+        ? ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
+        : ['B', 'kB', 'MB', 'GB', 'TB', 'PB'];
+    const index = bytes ? Math.min(Math.floor(Math.log(Math.abs(bytes)) / Math.log(base)), units.length - 1) : 0;
+    return `${(bytes / base ** index).toFixed(round)} ${units[index]}`;
+}
+
+function isMd5(value) {
+    return typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
+}
 
 /**
  * Utility helper functions for TeraBox API requests
@@ -41,7 +53,7 @@ function getChunkSize(fileSize, is_vip = true) {
  * @returns {Object} Calculated hashes for specific local file
  */
 async function hashFile(filePath) {
-    const stat = fs.statSync(filePath);
+    const stat = await fs.promises.stat(filePath);
     const sliceSize = 256 * 1024;
     const splitSize = getChunkSize(stat.size);
     const hashedData = newProgressData();
@@ -135,22 +147,24 @@ async function runWithConcurrencyLimit(data, tasks, limit) {
     const runTask = async () => {
         while (index < tasks.length && !failed) {
             const currentIndex = index++;
-            await tasks[currentIndex]();
+            try {
+                await tasks[currentIndex]();
+            }
+            catch (error) {
+                failed = true;
+                throw error;
+            }
         }
     };
-    
+
     const workers = Array.from({ length: limit }, () => runTask());
-    
-    try{
-        await Promise.all(workers);
-    }
-    catch(error){
-        console.error('\n[ERROR]', unwrapErrorMessage(error));
-        failed = true;
-    }
-    
+
+    const results = await Promise.allSettled(workers);
+    const failure = results.find(result => result.status === 'rejected');
+    if(failure) console.error('\n[ERROR]', unwrapErrorMessage(failure.reason));
+
     return {ok: !failed, data: data};
-};
+}
 
 /**
  * Format seconds to "99h99m99s" string
@@ -175,12 +189,12 @@ function printProgressLog(prepText, sentData, fsize){
     const partsData = Object.values(sentData.parts);
     
     const uploadedBytesSum = partsData.reduce((acc, value) => acc + value, 0);
-    const uploadedBytesStr = filesize(uploadedBytesSum, {standard: 'iec', round: 3, pad: true, separator: '.'});
-    const filesizeBytesStr = filesize(fsize, {standard: 'iec', round: 3, pad: true});
+    const uploadedBytesStr = formatBytes(uploadedBytesSum);
+    const filesizeBytesStr = formatBytes(fsize);
     const uploadedBytesFStr = `(${uploadedBytesStr}/${filesizeBytesStr})`;
     
     const uploadSpeed = sentData.all * 1000 / (Date.now() - sentData.start) || 0;
-    const uploadSpeedStr = filesize(uploadSpeed, {standard: 'si', round: 2, pad: true, separator: '.'}) + '/s';
+    const uploadSpeedStr = formatBytes(uploadSpeed, 'si', 2) + '/s';
     
     const remainingTimeInt = Math.max((fsize - uploadedBytesSum) / uploadSpeed, 0);
     const remainingTimeStr = formatEta(remainingTimeInt) + ' left...';
@@ -237,14 +251,14 @@ async function uploadChunkTask(app, data, file, partSeq, uploadData, externalAbo
             const chunkMd5 = data.hash.chunks[partSeq];
             
             // check if we have chunks hash
-            if (app.CheckMd5Val(chunkMd5) && res.md5 !== chunkMd5){
+            if (isMd5(chunkMd5) && res.md5 !== chunkMd5){
                 const md5Err = md5MismatchText(chunkMd5, res.md5, partSeq+1, data.hash.chunks.length);
                 throw new Error(md5Err.join('\n\t'));
             }
             
             // check if we don't have chunk hash and data.hash_check not set to false
             const skipChunkHashCheck = typeof data.hash_check === 'boolean' && data.hash_check === false;
-            if(!app.CheckMd5Val(chunkMd5) && !skipChunkHashCheck){
+            if(!isMd5(chunkMd5) && !skipChunkHashCheck){
                 const calcChunkMd5 = crypto.createHash('md5').update(buffer).digest('hex');
                 if(calcChunkMd5 !== res.md5){
                     const md5Err = md5MismatchText(calcChunkMd5, res.md5, partSeq+1, data.hash.chunks.length);
@@ -253,7 +267,7 @@ async function uploadChunkTask(app, data, file, partSeq, uploadData, externalAbo
             }
             
             // update chunkMd5 to res.md5
-            if(app.CheckMd5Val(res.md5) && chunkMd5 !== res.md5){
+            if(isMd5(res.md5) && chunkMd5 !== res.md5){
                 data.hash.chunks[partSeq] = res.md5;
             }
             
@@ -323,11 +337,7 @@ async function uploadChunks(app, data, filePath, maxTasks = 10, maxTries = 5) {
     const externalAbortController = new AbortController();
     uploadData.maxTries = maxTries;
     
-    if(data.uploaded.filter(pStatus => pStatus == false).length > 0){
-        const progressTimer = setInterval(() => {
-            printProgressLog('Uploading', uploadData, data.size);
-        }, 1000);
-        
+    if(data.uploaded.some(pStatus => pStatus == false)){
         for (let partSeq = 0; partSeq < totalChunks; partSeq++) {
             uploadData.parts[partSeq] = 0;
             if(data.uploaded[partSeq]){
@@ -336,25 +346,28 @@ async function uploadChunks(app, data, filePath, maxTasks = 10, maxTries = 5) {
             }
         }
         
-        const file = await fs.promises.open(filePath, 'r');
-        for (let partSeq = 0; partSeq < totalChunks; partSeq++) {
-            if(!data.uploaded[partSeq]){
-                tasks.push(() => {
-                    return uploadChunkTask(app, data, file, partSeq, uploadData, externalAbortController.signal);
-                });
+        let file;
+        let progressTimer;
+        try {
+            file = await fs.promises.open(filePath, 'r');
+            progressTimer = setInterval(() => printProgressLog('Uploading', uploadData, data.size), 1000);
+            for (let partSeq = 0; partSeq < totalChunks; partSeq++) {
+                if(!data.uploaded[partSeq]){
+                    tasks.push(() => uploadChunkTask(
+                        app, data, file, partSeq, uploadData, externalAbortController.signal
+                    ));
+                }
             }
+
+            printProgressLog('Uploading', uploadData, data.size);
+            return await runWithConcurrencyLimit(data, tasks, Math.min(tasks.length, maxTasks));
         }
-        
-        printProgressLog('Uploading', uploadData, data.size);
-        const cMaxTasks = totalChunks > maxTasks ? maxTasks : totalChunks;
-        const upload_status = await runWithConcurrencyLimit(data, tasks, cMaxTasks);
-        clearInterval(progressTimer);
-        
-        console.log();
-        externalAbortController.abort();
-        await file.close();
-        
-        return upload_status;
+        finally {
+            clearInterval(progressTimer);
+            externalAbortController.abort();
+            if(file) await file.close();
+            console.log();
+        }
     }
     
     return {ok: true, data};

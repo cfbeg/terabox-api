@@ -1,0 +1,484 @@
+import { FormUrlEncoded, makeRemoteFPath, checkMd5val, checkMd5arr, decodeMd5 } from '../utilities.js';
+import { request } from '../transport.js';
+
+export default class UploadMethods {
+    /**
+     * Initiates a precreate request for a file (reserve upload ID and pre-upload checks)
+     * @param {Object} data - File data including remote_dir, file, size, upload_id (optional), and hash info
+     * @param {string} data.remote_dir - Remote directory path
+     * @param {string} data.file - Filename
+     * @param {number} data.size - File size in bytes
+     * @param {string} [data.upload_id] - Existing upload ID for resuming
+     * @param {Object} data.hash - Hash information
+     * @param {string} data.hash.file - MD5 hash of full file
+     * @param {string} data.hash.slice - MD5 hash of first slice
+     * @param {number} data.hash.crc32 - CRC32 value
+     * @param {Array<string>} data.hash.chunks - Array of MD5 chunk hashes
+     * @returns {Promise<Object>} The precreate response JSON (includes upload_id, etc.)
+     * @async
+     * @throws {Error} Throws error if HTTP status is not 200 or request fails
+     * @memberof module:api~TeraBoxApp
+     * @instance
+     */
+    async precreateFile(data){
+        const formData = new FormUrlEncoded();
+        formData.append('path', makeRemoteFPath(data.remote_dir, data.file));
+        // formData.append('target_path', data.remote_dir);
+        formData.append('autoinit', 1);
+        formData.append('size', data.size);
+        formData.append('file_limit_switch_v34', 'true');
+        formData.append('block_list', '[]');
+        formData.append('rtype', 2);
+        
+        if(data.upload_id && typeof data.upload_id === 'string' && data.upload_id !== ''){
+            formData.append('uploadid', data.upload_id);
+        }
+        
+        // check if has correct md5 values
+        if(checkMd5val(data.hash.slice) && checkMd5val(data.hash.file)){
+            formData.append('content-md5', data.hash.file);
+            formData.append('slice-md5', data.hash.slice);
+        }
+        
+        // check crc32int and ignore field for crc32 out of range
+        if(Number.isSafeInteger(data.hash.crc32) && data.hash.crc32 >= 0 && data.hash.crc32 <= 0xFFFFFFFF){
+            formData.append('content-crc32', data.hash.crc32);
+        }
+        
+        // check chunks hash
+        if(!checkMd5arr(data.hash.chunks)){
+            const predefinedHash = ['5910a591dd8fc18c32a8f3df4fdc1761'];
+            
+            if(data.size > 4 * 1024 * 1024){
+                predefinedHash.push('a5fc157d78e6ad1c7e114b056c92821e');
+            }
+            
+            formData.set('block_list', JSON.stringify(predefinedHash));
+        }
+        else{
+            formData.set('block_list', JSON.stringify(data.hash.chunks));
+        }
+        
+        // formData.append('local_ctime', '');
+        // formData.append('local_mtime', '');
+        
+        const url = new URL(this.params.whost + '/api/precreate');
+        
+        try{
+            if(this.data.jsToken === ''){
+                await this.updateAppData();
+            }
+            
+            url.search = new URLSearchParams({
+                ...this.params.app,
+                jsToken: this.data.jsToken,
+            });
+            
+            const req = await request(url, {
+                method: 'POST',
+                body: formData.str(),
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': this.params.ua,
+                    'Cookie': this.params.cookie,
+                },
+                signal: AbortSignal.timeout(this.TERABOX_TIMEOUT),
+            });
+            
+            if (req.statusCode !== 200) {
+                throw new Error(`HTTP error! Status: ${req.statusCode}`);
+            }
+            
+            // uploadid	= 'P1-' + BASE64(ServerLocalIP + ':' + ServerTime + ':' + RequestID)
+            const rdata = await req.body.json();
+            // rdata.errno: 4000023 - need verify
+            if(rdata.errno === 4000023){
+                await this.updateAppData();
+                return await this.precreateFile(data);
+            }
+            return rdata;
+        }
+        catch (error) {
+            throw new Error('precreateFile', { cause: error });
+        }
+    }
+
+    /**
+     * Attempts a rapid upload using existing file hashes (skip actual upload if file already on server)
+     * @param {Object} data - File data including remote_dir, file, size, and hash info
+     * @param {string} data.remote_dir - Remote directory path
+     * @param {string} data.file - Filename
+     * @param {number} data.size - File size in bytes
+     * @param {Object} data.hash - Hash information
+     * @param {string} data.hash.file - MD5 hash of full file
+     * @param {string} data.hash.slice - MD5 hash of first slice
+     * @param {number} data.hash.crc32 - CRC32 value
+     * @param {Array<string>} [data.hash.chunks] - Array of MD5 chunk hashes
+     * @returns {Promise<Object>} The rapid upload response JSON (indicates success or fallback)
+     * @async
+     * @throws {Error} Throws error if file size < 256KB, invalid hashes, HTTP status is not 200, or request fails
+     * @memberof module:api~TeraBoxApp
+     * @instance
+     */
+    async rapidUpload(data){
+        const formData = new FormUrlEncoded({
+            path:  makeRemoteFPath(data.remote_dir, data.file),
+            //target_path: data.remote_dir
+            'content-length': data.size,
+            'content-md5': data.hash.file,
+            'slice-md5': data.hash.slice,
+            'content-crc32': data.hash.crc32,
+            //local_ctime: '',
+            //local_mtime: '',
+            block_list: JSON.stringify(data.hash.chunks || []),
+            rtype: 2,
+            mode: 1,
+        });
+        
+        if(!checkMd5val(data.hash.slice) || !checkMd5val(data.hash.file)){
+            const badMD5 = new Error('Bad MD5 Slice Hash or MD5 File Hash');
+            throw new Error('rapidUpload', { cause: badMD5 });
+        }
+        
+        if(!Number.isSafeInteger(data.hash.crc32) || data.hash.crc32 < 0 || data.hash.crc32 > 0xFFFFFFFF){
+            formData.delete('content-crc32');
+        }
+        
+        if(!checkMd5arr(data.hash.chunks)){
+            // use unsafe rapid upload if we don't have chunks hash
+            formData.delete('block_list');
+            formData.set('rtype', 3);
+        }
+        
+        const url = new URL(this.params.whost + '/api/rapidupload');
+        
+        try{
+            if(data.size < 256 * 1024){
+                throw new Error('File size too small!');
+            }
+            
+            const req = await request(url, {
+                method: 'POST',
+                body: formData.str(),
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': this.params.ua,
+                    'Cookie': this.params.cookie,
+                },
+                signal: AbortSignal.timeout(this.TERABOX_TIMEOUT),
+            });
+            
+            if (req.statusCode !== 200) {
+                throw new Error(`HTTP error! Status: ${req.statusCode}`);
+            }
+            
+            const rdata = await req.body.json();
+            
+            return rdata;
+        }
+        catch (error) {
+            throw new Error('rapidUpload', { cause: error });
+        }
+    }
+
+    /**
+     * Retrieves an upload host endpoint to use for file uploads
+     * @returns {Promise<Object>} The upload host response JSON (includes host field)
+     * @async
+     * @throws {Error} Throws error if HTTP status is not 200 or request fails
+     * @memberof module:api~TeraBoxApp
+     * @instance
+     */
+    async getUploadHost(){
+        const url = new URL(this.params.whost + '/rest/2.0/pcs/file?method=locateupload');
+        try{
+            const req = await request(url, {
+                headers: {
+                    'User-Agent': this.params.ua,
+                    'Cookie': this.params.cookie,
+                },
+                signal: AbortSignal.timeout(this.TERABOX_TIMEOUT),
+            });
+            
+            if (req.statusCode !== 200) {
+                throw new Error(`HTTP error! Status: ${req.statusCode}`);
+            }
+            
+            // now it can be response as need verify error, even in browsers
+            const rdata = await req.body.json();
+            if(!rdata.errno){
+                this.params.uhost = 'https://' + rdata.host;
+            }
+            
+            return rdata;
+        }
+        catch (error) {
+            throw new Error('getUploadHost', { cause: error });
+        }
+    }
+
+    /**
+     * Uploads a single chunk (part) of a file
+     * @param {Object} data - File data including remote_dir, file, upload_id
+     * @param {number} partseq - The sequence number of this chunk (0-based)
+     * @param {Blob|Buffer} blob - The binary data of the chunk
+     * @param {function} [reqHandler] - Optional request progress handler
+     * @param {AbortSignal} [externalAbort] - Optional external abort signal
+     * @returns {Promise<Object>} The upload chunk response JSON (includes MD5 for chunk)
+     * @async
+     * @throws {Error} Throws error if HTTP status is not 200, chunk upload fails, or request times out
+     * @memberof module:api~TeraBoxApp
+     * @instance
+     */
+    async uploadChunk(data, partseq, blob, reqHandler, externalAbort) {
+        const timeoutAborter = new AbortController;
+        const timeoutId = setTimeout(() => { timeoutAborter.abort(); }, this.TERABOX_TIMEOUT);
+        externalAbort = externalAbort ? externalAbort : new AbortController().signal;
+        
+        const url = new URL(`${this.params.uhost}/rest/2.0/pcs/superfile2`);
+        url.search = new URLSearchParams({
+            method: 'upload',
+            ...this.params.app,
+            // type: 'tmpfile',
+            path: makeRemoteFPath(data.remote_dir, data.file),
+            uploadid: data.upload_id,
+            // uploadsign: 0,
+            partseq: partseq,
+        });
+        
+        const formData = new FormData();
+        formData.append('file', blob, 'blob');
+        
+        let req;
+        try {
+            req = await request(url, {
+                method: 'POST',
+                body: formData,
+                headers: {
+                    'User-Agent': this.params.ua,
+                    'Cookie': this.params.cookie,
+                },
+                signal: AbortSignal.any([
+                    externalAbort,
+                    timeoutAborter.signal,
+                ]),
+            });
+        }
+        finally {
+            clearTimeout(timeoutId);
+        }
+        
+        if (req.statusCode !== 200) {
+            throw new Error(`HTTP error! Status: ${req.statusCode}`);
+        }
+        
+        const res = await req.body.json();
+        if (res.error_code) {
+            const uploadError = new Error(`Upload failed! Error Code #${res.error_code}`);
+            uploadError.data = res;
+            throw uploadError;
+        }
+        return res;
+    }
+
+    /**
+     * Creates a new directory in the remote file system
+     * @param {string} remoteDir - The path of the directory to create
+     * @returns {Promise<Object>} The create directory response JSON
+     * @async
+     * @throws {Error} Throws error if HTTP status is not 200 or request fails
+     * @memberof module:api~TeraBoxApp
+     * @instance
+     */
+    async createDir(remoteDir){
+        const formData = new FormUrlEncoded();
+        formData.append('path', remoteDir);
+        formData.append('isdir', 1);
+        formData.append('block_list', '[]');
+        
+        const url = new URL(this.params.whost + '/api/create?a=commit');
+        
+        try{
+            const req = await request(url, {
+                method: 'POST',
+                body: formData.str(),
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': this.params.ua,
+                    'Cookie': this.params.cookie,
+                },
+                signal: AbortSignal.timeout(this.TERABOX_TIMEOUT),
+            });
+            
+            if (req.statusCode !== 200) {
+                throw new Error(`HTTP error! Status: ${req.statusCode}`);
+            }
+            
+            const rdata = await req.body.json();
+            // rdata.errno: -7 - param  path file name is invalid
+            return rdata;
+        }
+        catch (error) {
+            throw new Error('createFolder', { cause: error });
+        }
+    }
+
+    /**
+     * Creates a new file entry on the server after uploading chunks
+     * @param {Object} data - File data including remote_dir, file, size, hash, upload_id, and chunks
+     * @param {string} data.remote_dir - Remote directory path
+     * @param {string} data.file - Filename
+     * @param {number} data.size - File size in bytes
+     * @param {Object} data.hash - Hash information
+     * @param {string} data.hash.file - MD5 hash of full file
+     * @param {string} data.hash.slice - MD5 hash of first slice
+     * @param {number} data.hash.crc32 - CRC32 value
+     * @param {Array<string>} data.hash.chunks - Array of MD5 chunk hashes
+     * @param {string} data.upload_id - Upload ID obtained from precreate
+     * @returns {Promise<Object>} The create file response JSON (includes MD5 and ETag)
+     * @async
+     * @throws {Error} Throws error if HTTP status is not 200 or request fails
+     * @memberof module:api~TeraBoxApp
+     * @instance
+     */
+    async createFile(data){
+        const formData = new FormUrlEncoded();
+        formData.append('path', makeRemoteFPath(data.remote_dir, data.file));
+        // formData.append('isdir', 0);
+        formData.append('size', data.size);
+        formData.append('isdir', 0);
+        
+        // check if has correct md5 values
+        if(checkMd5val(data.hash.slice) && checkMd5val(data.hash.file)){
+            formData.append('content-md5', data.hash.file);
+            formData.append('slice-md5', data.hash.slice);
+        }
+        
+        // check crc32int and ignore field for crc32 out of range
+        if(Number.isSafeInteger(data.hash.crc32) && data.hash.crc32 >= 0 && data.hash.crc32 <= 0xFFFFFFFF){
+            formData.append('content-crc32', data.hash.crc32);
+        }
+        
+        formData.append('block_list', JSON.stringify(data.hash.chunks));;
+        formData.append('uploadid', data.upload_id);
+        formData.append('rtype', 2);
+        
+        // formData.append('local_ctime', '');
+        // formData.append('local_mtime', '');
+        // formData.append('zip_quality', '');
+        // formData.append('zip_sign', '');
+        // formData.append('is_revision', 0);
+        // formData.append('mode', 2); // 2 is Batch Upload
+        // formData.append('exif_info', exifJsonStr);
+        
+        const url = new URL(this.params.whost + '/api/create');
+        
+        try{
+            const req = await request(url, {
+                method: 'POST',
+                body: formData.str(),
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': this.params.ua,
+                    'Cookie': this.params.cookie,
+                },
+                signal: AbortSignal.timeout(this.TERABOX_TIMEOUT),
+            });
+            
+            if (req.statusCode !== 200) {
+                throw new Error(`HTTP error! Status: ${req.statusCode}`);
+            }
+            
+            const rdata = await req.body.json();
+            // rdata.errno: 31355 - pcs service failed
+            if(rdata.md5){
+                // encrypted etag
+                rdata.emd5 = rdata.md5;
+                // decrypted etag (without chunk count)
+                rdata.md5 = decodeMd5(rdata.emd5);
+                // set custom etag
+                rdata.etag = rdata.md5;
+                if(data.hash.chunks.length > 1){
+                    rdata.etag += '-' + data.hash.chunks.length;
+                }
+            }
+            return rdata;
+        }
+        catch (error) {
+            console.log(error);
+            throw new Error('createFile', { cause: error });
+        }
+    }
+
+    /**
+     * Performs file management operations (delete, copy, move, rename)
+     * @param {string} operation - Operation type: 'delete', 'copy', 'move', 'rename'
+     * @param {Array} fmparams - Parameters for the operation (array of paths or objects)
+     * @returns {Promise<Object>} The file manager response JSON
+     * @async
+     * @throws {Error} Throws error if fmparams is not an array, HTTP status is not 200, or request fails
+     * @memberof module:api~TeraBoxApp
+     * @instance
+     */
+    async filemanager(operation, fmparams){
+        // For Delete: ["/path1","path2.rar"]
+        // For Move: [{"path":"/myfolder/source.bin","dest":"/target/","newname":"newfilename.bin"}]
+        // For Copy same as move
+        // + "ondup": newcopy, overwrite (optional, skip by default)
+        // For rename [{"id":1111,"path":"/dir1/src.bin","newname":"myfile2.bin"}]
+        
+        // operation - copy (file copy), move (file movement), rename (file renaming), and delete (file deletion)
+        // opera=copy: filelist: [{"path":"/hello/test.mp4","dest":"","newname":"test.mp4"}]
+        // opera=move: filelist: [{"path":"/test.mp4","dest":"/test_dir","newname":"test.mp4"}]
+        // opera=rename: filelist：[{"path":"/hello/test.mp4","newname":"test_one.mp4"}]
+        // opera=delete: filelist: ["/test.mp4"]
+        
+        if(!Array.isArray(fmparams)){
+            throw new Error('filemanager', { cause: new Error('FS paths should be in array!') });
+        }
+        
+        const url = new URL(this.params.whost + '/api/filemanager');
+        
+        const formData = new FormUrlEncoded();
+        formData.append('filelist', JSON.stringify(fmparams));
+        
+        try{
+            if(this.data.jsToken === ''){
+                await this.updateAppData();
+            }
+            
+            url.search = new URLSearchParams({
+                ...this.params.app,
+                jsToken: this.data.jsToken,
+                // 'async': 1,
+                onnest: 'fail',
+                opera: operation, // delete, copy, move, rename
+            });
+            
+            const req = await request(url, {
+                method: 'POST',
+                body: formData.str(),
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': this.params.ua,
+                    'Cookie': this.params.cookie,
+                },
+                signal: AbortSignal.timeout(this.TERABOX_TIMEOUT),
+            });
+            
+            if (req.statusCode !== 200) {
+                throw new Error(`HTTP error! Status: ${req.statusCode}`);
+            }
+            
+            const rdata = await req.body.json();
+            if(rdata.errno === 450016){
+                await this.updateAppData();
+                return await this.filemanager(operation, fmparams);
+            }
+            return rdata;
+        }
+        catch (error) {
+            throw new Error('filemanager', { cause: error });
+        }
+    }
+}

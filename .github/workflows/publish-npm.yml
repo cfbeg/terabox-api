@@ -1,13 +1,14 @@
-name: Publish NPM Package
+name: Publish @cfbeg/terabox-api
 
 on:
+  workflow_dispatch:
   push:
     tags:
-      - 'api-*'
+      - 'lightweight-v*'
 
 permissions:
-  id-token: write  # Required for OIDC
-  contents: write
+  contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -16,20 +17,31 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - name: Setup NodeJS
-        uses: actions/setup-node@v6
         with:
-          node-version: 25
-          registry-url: 'https://registry.npmjs.org'
+          fetch-depth: 0
       - name: PNPM Setup
         uses: pnpm/action-setup@v5
         with:
           version: 10
-      - name: PNPM Install
-        run: pnpm install
-      - name: PNPM Publish
-        run: pnpm publish --no-git-checks
-      - name: Create Release
-        uses: softprops/action-gh-release@v3
+      - name: Setup NodeJS
+        uses: actions/setup-node@v6
         with:
-          generate_release_notes: true
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - name: Verify lightweight source
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/lightweight" ]]
+          else
+            git fetch origin lightweight:refs/remotes/origin/lightweight
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/lightweight
+            [[ "$GITHUB_REF_NAME" == "lightweight-v$(node -p "require('./package.json').version")" ]]
+          fi
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Check
+        run: pnpm lint && pnpm test
+      - name: Publish
+        run: npm publish --access public

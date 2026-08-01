@@ -1,12 +1,22 @@
 {
-    "name": "terabox-api",
+    "name": "@cfbeg/terabox-api",
     "name_ext": "TeraBox API",
     "version": "2.9.5",
     "main": "api.js",
     "type": "module",
+    "files": [
+        "api.js",
+        "helper.js",
+        "internal"
+    ],
+    "engines": {
+        "node": ">=22.19"
+    },
     "scripts": {
-        "html": "python docs/apidoc.py",
-        "lint": "eslint . --config .eslint.config.js"
+        "html": "python -X utf8 docs/apidoc.py",
+        "lint": "eslint . --config .eslint.config.js",
+        "test": "node --test test/*.test.js",
+        "test:live": "node --test test/live.test.js"
     },
     "keywords": [
         "terabox"
@@ -14,19 +24,16 @@
     "author": "Seiya Dev.",
     "license": "MIT",
     "description": "NodeJS tool for interacting with the TeraBox cloud service without the need to use the website or app ☁️",
-    "homepage": "https://github.com/seiya-npm/terabox-api#readme",
+    "homepage": "https://github.com/cfbeg/terabox-api#readme",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/seiya-npm/terabox-api.git"
+        "url": "git+https://github.com/cfbeg/terabox-api.git"
     },
     "bugs": {
-        "url": "https://github.com/seiya-npm/terabox-api/issues"
+        "url": "https://github.com/cfbeg/terabox-api/issues"
     },
     "dependencies": {
-        "crc-32": "^1.2.2",
-        "filesize": "^11.0.22",
-        "tough-cookie": "^6.0.2",
-        "undici": "^8.9.0"
+        "crc-32": "^1.2.2"
     },
     "devDependencies": {
         "@eslint/js": "^10.0.1",
